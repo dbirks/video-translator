@@ -244,24 +244,62 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
         from backend.adapters.tts import FishAudioTTSAdapter, MockTTSAdapter, OpenAITTSAdapter
         from backend.services.media import get_duration
 
-        # Extract a voice reference clip from the original audio
-        voice_ref_path = None
-        if db_segments:
-            best_seg = max(db_segments, key=lambda seg: min(seg.end_sec - seg.start_sec, 15.0))
-            ref_start = best_seg.start_sec
-            ref_end = min(best_seg.end_sec, ref_start + 15.0)
-            voice_ref_rel = os.path.join(lecture_id, "voice_reference.wav")
-            voice_ref_path = os.path.join(settings.media_dir, voice_ref_rel)
-            from backend.services.media import extract_clip
-            await extract_clip(wav_abs, voice_ref_path, ref_start, ref_end)
+        # Extract voice reference clips — one per speaker for multi-speaker support
+        from backend.services.media import extract_clip, concat_clips
+        speaker_voice_refs: dict[str, str] = {}  # speaker label -> abs path
 
+        speakers = sorted(set(seg.speaker or "A" for seg in db_segments))
+        _publish(lecture_id, {"step": "dubbing", "progress": 0.72,
+                              "detail": f"Extracting voice references for {len(speakers)} speaker(s)"})
+
+        for spk in speakers:
+            spk_segs = sorted(
+                [s for s in db_segments if (s.speaker or "A") == spk],
+                key=lambda s: s.end_sec - s.start_sec,
+                reverse=True,
+            )
+            # Collect clips up to 20 seconds total for this speaker
+            clips: list[tuple[float, float]] = []
+            total_ref = 0.0
+            for seg in spk_segs:
+                dur = min(seg.end_sec - seg.start_sec, 10.0)
+                if dur < 0.5:
+                    continue
+                clips.append((seg.start_sec, seg.start_sec + dur))
+                total_ref += dur
+                if total_ref >= 20.0:
+                    break
+
+            if not clips:
+                continue
+
+            ref_rel = os.path.join(lecture_id, f"voice_ref_{spk}.wav")
+            ref_abs = os.path.join(settings.media_dir, ref_rel)
+
+            if len(clips) == 1:
+                await extract_clip(wav_abs, ref_abs, clips[0][0], clips[0][1])
+            else:
+                # Extract each clip then concatenate
+                clip_paths = []
+                for ci, (cs, ce) in enumerate(clips):
+                    cp = os.path.abspath(os.path.join(settings.media_dir, lecture_id, f"_ref_{spk}_{ci}.wav"))
+                    await extract_clip(wav_abs, cp, cs, ce)
+                    clip_paths.append(cp)
+                await concat_clips(clip_paths, ref_abs)
+                for cp in clip_paths:
+                    os.remove(cp)
+
+            speaker_voice_refs[spk] = ref_abs
             ref_mo = MediaObject(
                 lecture_id=lecture_id, kind="voice_reference",
-                file_path=voice_ref_rel, size_bytes=os.path.getsize(voice_ref_path),
+                file_path=ref_rel, size_bytes=os.path.getsize(ref_abs),
                 mime_type="audio/wav",
             )
             session.add(ref_mo)
-            session.commit()
+
+        session.commit()
+        # Fallback single ref for adapters that don't support multi-speaker
+        voice_ref_path = next(iter(speaker_voice_refs.values()), None)
 
         if s.fish_api_key:
             tts_adapter = FishAudioTTSAdapter(api_key=s.fish_api_key)
@@ -285,21 +323,24 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
             group_end = group[-1].end_sec
             window = group_end - group_start
 
+            # Pick the voice reference for this group's speaker
+            group_speaker = group[0].speaker or "A"
+            group_voice_ref = speaker_voice_refs.get(group_speaker, voice_ref_path)
+
             speed = 1.0
             audio_bytes = None
             audio_fmt = "mp3"
             tts_duration = 0.0
             qa_flags = []
 
-            # Estimate reasonable max duration: ~6 chars/sec for Spanish speech
+            # Estimate reasonable max duration based on text length
             max_reasonable_duration = max(window * 2.5, len(translated_text) / 4.0)
 
             for attempt_speed in [1.0, 1.1, 1.2, 1.35]:
-                # Retry up to 2 times per speed if TTS hallucinates
                 for retry in range(2):
                     audio_bytes, audio_fmt = await tts_adapter.synthesize(
                         translated_text,
-                        voice_ref_path=voice_ref_path,
+                        voice_ref_path=group_voice_ref,
                         language=lecture.target_language,
                         speed=attempt_speed,
                     )

@@ -221,6 +221,35 @@ async def extract_clip(audio_path: str, output_path: str, start_sec: float, end_
         raise RuntimeError(f"ffmpeg extract_clip failed (rc={returncode}): {stderr}")
 
 
+async def concat_clips(clip_paths: list[str], output_path: str) -> None:
+    """Concatenate multiple audio clips into one file using ffmpeg filter."""
+    if len(clip_paths) == 1:
+        # Just copy
+        import shutil
+        shutil.copy2(clip_paths[0], output_path)
+        return
+
+    # Use filter_complex concat instead of concat demuxer (avoids file path issues)
+    inputs = []
+    for cp in clip_paths:
+        inputs += ["-i", os.path.abspath(cp)]
+
+    n = len(clip_paths)
+    filter_str = "".join(f"[{i}:a]" for i in range(n)) + f"concat=n={n}:v=0:a=1[out]"
+
+    returncode, _, stderr = await _run_ffmpeg(
+        *inputs,
+        "-filter_complex", filter_str,
+        "-map", "[out]",
+        "-acodec", "pcm_s16le",
+        "-ar", "44100",
+        "-ac", "1",
+        output_path,
+    )
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg concat_clips failed (rc={returncode}): {stderr}")
+
+
 async def mux_export(video_path: str, audio_path: str, output_path: str) -> None:
     """Replace the audio track of a video with the mixed audio, producing an MP4."""
     returncode, _, stderr = await _run_ffmpeg(
