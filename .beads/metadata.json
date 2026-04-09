@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "video_translator",
+  "project_id": "8bc0312c-ad47-4abb-b742-1e035861a785"
+}
