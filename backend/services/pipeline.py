@@ -123,11 +123,14 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
         # --- Step 4: Transcribe ---
         step("transcribing", 0.35)
 
-        from backend.adapters.transcription import OpenAITranscriptionAdapter
+        from backend.adapters.transcription import MockTranscriptionAdapter, OpenAITranscriptionAdapter
         from backend.config import get_settings as _get_settings
 
         s = _get_settings()
-        transcriber = OpenAITranscriptionAdapter(api_key=s.openai_api_key or None)
+        if s.openai_api_key:
+            transcriber = OpenAITranscriptionAdapter(api_key=s.openai_api_key)
+        else:
+            transcriber = MockTranscriptionAdapter()
         transcript_segments = await transcriber.transcribe(norm_abs, language=lecture.source_language)
 
         # Remove any existing segments for this lecture

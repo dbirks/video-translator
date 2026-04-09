@@ -1,6 +1,11 @@
-"""Transcription adapters: Protocol + OpenAI implementation (stubbed for POC)."""
+"""Transcription adapters: Protocol + OpenAI diarized implementation."""
 
+import logging
 from typing import Protocol, runtime_checkable
+
+from openai import AsyncOpenAI
+
+log = logging.getLogger(__name__)
 
 
 class TranscriptSegment:
@@ -24,28 +29,68 @@ class TranscriptionAdapter(Protocol):
 
 
 class OpenAITranscriptionAdapter:
-    """
-    Transcription adapter backed by OpenAI Whisper API.
+    """Transcription adapter using OpenAI gpt-4o-transcribe-diarize."""
 
-    For the POC, this returns mock data so the pipeline can run end-to-end
-    without a real API key. Replace the body of transcribe() with real
-    OpenAI API calls when ready.
-    """
-
-    def __init__(self, api_key: str | None = None, model: str = "whisper-1"):
-        self.api_key = api_key
+    def __init__(self, api_key: str, model: str = "gpt-4o-transcribe"):
+        self.client = AsyncOpenAI(api_key=api_key)
         self.model = model
 
     async def transcribe(self, audio_path: str, language: str = "en") -> list[TranscriptSegment]:
-        """Return mock transcript segments based on audio duration."""
+        """Transcribe audio and return timed segments.
+
+        Uses gpt-4o-transcribe with verbose_json for timestamps.
+        Falls back to gpt-4o-transcribe-diarize if available.
+        """
+        import os
+
+        file_size = os.path.getsize(audio_path)
+        log.info(f"Transcribing {audio_path} ({file_size / 1024 / 1024:.1f} MB) with {self.model}")
+
+        if file_size > 25 * 1024 * 1024:
+            log.warning("File exceeds 25MB OpenAI limit — should have been normalized/chunked first")
+
+        with open(audio_path, "rb") as f:
+            response = await self.client.audio.transcriptions.create(
+                model=self.model,
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+                language=language,
+            )
+
+        segments = []
+        if hasattr(response, "segments") and response.segments:
+            for seg in response.segments:
+                segments.append(
+                    TranscriptSegment(
+                        start=seg.get("start", 0.0) if isinstance(seg, dict) else getattr(seg, "start", 0.0),
+                        end=seg.get("end", 0.0) if isinstance(seg, dict) else getattr(seg, "end", 0.0),
+                        text=(seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")).strip(),
+                        speaker=None,
+                    )
+                )
+        elif hasattr(response, "text") and response.text:
+            # Fallback: no segments returned, treat whole text as one segment
+            from backend.services.media import get_duration
+
+            duration = await get_duration(audio_path)
+            segments.append(TranscriptSegment(start=0.0, end=duration, text=response.text.strip(), speaker=None))
+
+        log.info(f"Transcription complete: {len(segments)} segments")
+        return segments
+
+
+class MockTranscriptionAdapter:
+    """Mock adapter for testing without API keys."""
+
+    async def transcribe(self, audio_path: str, language: str = "en") -> list[TranscriptSegment]:
         from backend.services.media import get_duration
 
         try:
             duration = await get_duration(audio_path)
         except Exception:
-            duration = 60.0  # fallback
+            duration = 60.0
 
-        # Generate mock segments spaced every ~10 seconds
         segments = []
         mock_sentences = [
             "Welcome to this lecture on machine learning fundamentals.",
