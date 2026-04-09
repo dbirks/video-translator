@@ -59,12 +59,17 @@ class FishAudioTTSAdapter:
         log.info(f"Fish TTS (speed={speed}): {text[:60]}...")
 
         # Build request body
+        # Limit max tokens to prevent hallucination/runaway generation
+        # ~6 chars per second of speech, each token ~0.02s, so max_tokens ~ text_len * 3
+        max_tokens = max(512, len(text) * 3)
         body: dict = {
             "text": text,
             "format": "mp3",
             "mp3_bitrate": 128,
             "sample_rate": 44100,
             "normalize": True,
+            "max_new_tokens": max_tokens,
+            "repetition_penalty": 1.5,
         }
 
         if speed != 1.0:

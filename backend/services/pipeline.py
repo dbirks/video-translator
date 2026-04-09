@@ -291,26 +291,55 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
             tts_duration = 0.0
             qa_flags = []
 
-            for attempt_speed in [1.0, 1.1, 1.2, 1.35]:
-                audio_bytes, audio_fmt = await tts_adapter.synthesize(
-                    translated_text,
-                    voice_ref_path=voice_ref_path,
-                    language=lecture.target_language,
-                    speed=attempt_speed,
-                )
-                tmp_path = os.path.join(tts_dir, f"group_{gi}_tmp.{audio_fmt}")
-                with open(tmp_path, "wb") as f:
-                    f.write(audio_bytes)
-                try:
-                    tts_duration = await get_duration(tmp_path)
-                except Exception:
-                    tts_duration = 0.0
-                os.remove(tmp_path)
+            # Estimate reasonable max duration: ~6 chars/sec for Spanish speech
+            max_reasonable_duration = max(window * 2.5, len(translated_text) / 4.0)
 
-                speed = attempt_speed
-                overflow = (tts_duration - window) / window if window > 0 else 0
-                if overflow <= 0.15:
-                    break
+            for attempt_speed in [1.0, 1.1, 1.2, 1.35]:
+                # Retry up to 2 times per speed if TTS hallucinates
+                for retry in range(2):
+                    audio_bytes, audio_fmt = await tts_adapter.synthesize(
+                        translated_text,
+                        voice_ref_path=voice_ref_path,
+                        language=lecture.target_language,
+                        speed=attempt_speed,
+                    )
+                    tmp_path = os.path.join(tts_dir, f"group_{gi}_tmp.{audio_fmt}")
+                    with open(tmp_path, "wb") as f:
+                        f.write(audio_bytes)
+                    try:
+                        tts_duration = await get_duration(tmp_path)
+                    except Exception:
+                        tts_duration = 0.0
+                    os.remove(tmp_path)
+
+                    # Detect hallucination: output wildly longer than expected
+                    if tts_duration <= max_reasonable_duration:
+                        break
+                    _publish(lecture_id, {"step": "dubbing", "progress": 0.70,
+                                         "detail": f"Group {gi}: TTS hallucinated ({tts_duration:.1f}s for {len(translated_text)} chars), retrying..."})
+
+                if tts_duration <= max_reasonable_duration:
+                    speed = attempt_speed
+                    overflow = (tts_duration - window) / window if window > 0 else 0
+                    if overflow <= 0.15:
+                        break
+
+            # If still hallucinated after retries, truncate to window duration with ffmpeg
+            if tts_duration > max_reasonable_duration:
+                qa_flags.append(f"HALLUCINATION_TRUNCATED: {tts_duration:.1f}s truncated to {window:.1f}s")
+                truncated_path = os.path.join(tts_dir, f"group_{gi}_trunc.{audio_fmt}")
+                with open(os.path.join(tts_dir, f"group_{gi}_raw.{audio_fmt}"), "wb") as f:
+                    f.write(audio_bytes)
+                from backend.services.media import _run_ffmpeg
+                await _run_ffmpeg(
+                    "-i", os.path.join(tts_dir, f"group_{gi}_raw.{audio_fmt}"),
+                    "-t", str(window),
+                    "-acodec", "copy",
+                    truncated_path,
+                )
+                with open(truncated_path, "rb") as f:
+                    audio_bytes = f.read()
+                tts_duration = window
 
             if tts_duration > window * 1.15:
                 qa_flags.append(f"TOO_LONG: {tts_duration:.1f}s vs {window:.1f}s window (speed={speed})")
