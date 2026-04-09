@@ -1,13 +1,16 @@
 import asyncio
+import os
 from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from backend.config import get_settings
 from backend.database import get_session
-from backend.models import Segment, Translation, TTSGeneration
+from backend.models import MediaObject, Segment, Translation, TTSGeneration
 
 router = APIRouter()
 
@@ -60,6 +63,26 @@ def list_segments(lecture_id: str, session: SessionDep) -> list[SegmentWithTrans
         result.append(SegmentWithTranslation(segment=seg, translation=translation, tts=tts))
 
     return result
+
+
+@router.get("/segments/{segment_id}/audio")
+def serve_segment_audio(segment_id: str, session: SessionDep):
+    """Serve the TTS audio file for a segment."""
+    tts = session.exec(
+        select(TTSGeneration)
+        .where(TTSGeneration.segment_id == segment_id, TTSGeneration.status == "current")
+        .order_by(TTSGeneration.created_at.desc())  # type: ignore[arg-type]
+    ).first()
+    if not tts or not tts.media_object_id:
+        raise HTTPException(status_code=404, detail="No TTS audio for this segment")
+    mo = session.get(MediaObject, tts.media_object_id)
+    if not mo:
+        raise HTTPException(status_code=404, detail="Media object not found")
+    settings = get_settings()
+    abs_path = os.path.join(settings.media_dir, mo.file_path)
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(abs_path, media_type=mo.mime_type or "audio/mpeg")
 
 
 @router.patch("/segments/{segment_id}", response_model=Segment)

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -9,19 +9,28 @@ import {
   type SegmentWithTranslation,
 } from "@/lib/api";
 import { formatTimestamp } from "@/lib/utils";
-import { RefreshCw, Volume2 } from "lucide-react";
+import { RefreshCw, Volume2, Play, Square } from "lucide-react";
 
 interface Props {
   segments: SegmentWithTranslation[];
   onRefresh: () => Promise<void>;
+  sourceLanguage?: string;
+  targetLanguage?: string;
 }
 
-export default function SegmentEditor({ segments, onRefresh }: Props) {
+export default function SegmentEditor({ segments, onRefresh, sourceLanguage = "en", targetLanguage = "es" }: Props) {
   const [editingEn, setEditingEn] = useState<string | null>(null);
   const [editingEs, setEditingEs] = useState<string | null>(null);
   const [enText, setEnText] = useState("");
   const [esText, setEsText] = useState("");
   const [busy, setBusy] = useState<Set<string>>(new Set());
+  const [playingId, setPlayingId] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const langNames: Record<string, string> = {
+    en: "English", es: "Spanish", ja: "Japanese", fr: "French", de: "German",
+    pt: "Portuguese", it: "Italian", zh: "Chinese", ko: "Korean", ar: "Arabic",
+  };
 
   const withBusy = async (segId: string, fn: () => Promise<unknown>) => {
     setBusy((prev) => new Set(prev).add(segId));
@@ -47,7 +56,30 @@ export default function SegmentEditor({ segments, onRefresh }: Props) {
     setEditingEs(null);
   };
 
-  const staleCount = segments.filter(
+  const playTTS = (segId: string) => {
+    if (playingId === segId && audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+      setPlayingId(null);
+      return;
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+    const audio = new Audio(`/api/segments/${segId}/audio`);
+    audio.onended = () => setPlayingId(null);
+    audio.onerror = () => setPlayingId(null);
+    audio.play();
+    audioRef.current = audio;
+    setPlayingId(segId);
+  };
+
+  // Filter out grouped sub-segments — only show primary segments with real translations
+  const visibleSegments = segments.filter(
+    (s) => !s.translation?.translated_text.startsWith("[part of group")
+  );
+
+  const staleCount = visibleSegments.filter(
     (s) => s.translation?.status === "stale" || s.tts?.status === "stale",
   ).length;
 
@@ -55,7 +87,7 @@ export default function SegmentEditor({ segments, onRefresh }: Props) {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold">
-          Segments ({segments.length})
+          Segments ({visibleSegments.length})
           {staleCount > 0 && (
             <Badge variant="warning" className="ml-2">
               {staleCount} stale
@@ -66,30 +98,38 @@ export default function SegmentEditor({ segments, onRefresh }: Props) {
 
       <div className="border border-border rounded-lg overflow-hidden">
         {/* Header */}
-        <div className="grid grid-cols-[80px_1fr_1fr_100px] gap-2 p-3 bg-secondary/50 text-xs font-medium text-muted-foreground uppercase tracking-wider">
+        <div className="grid grid-cols-[80px_1fr_1fr_120px] gap-2 p-3 bg-secondary/50 text-xs font-medium text-muted-foreground uppercase tracking-wider">
           <div>Time</div>
-          <div>English</div>
-          <div>Spanish</div>
+          <div>{langNames[sourceLanguage] ?? sourceLanguage}</div>
+          <div>{langNames[targetLanguage] ?? targetLanguage}</div>
           <div className="text-right">Actions</div>
         </div>
 
         {/* Rows */}
-        {segments.map(({ segment: seg, translation: trans, tts }) => {
+        {visibleSegments.map(({ segment: seg, translation: trans, tts }) => {
           const isBusy = busy.has(seg.id);
           const isTransStale = trans?.status === "stale";
           const isTTSStale = tts?.status === "stale";
+          const hasTTS = tts?.media_object_id;
 
           return (
             <div
               key={seg.id}
-              className="grid grid-cols-[80px_1fr_1fr_100px] gap-2 p-3 border-t border-border items-start hover:bg-secondary/20"
+              className="grid grid-cols-[80px_1fr_1fr_120px] gap-2 p-3 border-t border-border items-start hover:bg-secondary/20"
             >
-              {/* Timestamp */}
-              <div className="text-xs text-muted-foreground font-mono pt-1">
-                {formatTimestamp(seg.start_sec)}
+              {/* Timestamp + speaker */}
+              <div>
+                <div className="text-xs text-muted-foreground font-mono">
+                  {formatTimestamp(seg.start_sec)}
+                </div>
+                {seg.speaker && (
+                  <div className="text-[10px] text-muted-foreground/60 mt-0.5">
+                    {seg.speaker}
+                  </div>
+                )}
               </div>
 
-              {/* English */}
+              {/* Source language */}
               <div>
                 {editingEn === seg.id ? (
                   <div className="space-y-1">
@@ -122,7 +162,7 @@ export default function SegmentEditor({ segments, onRefresh }: Props) {
                 )}
               </div>
 
-              {/* Spanish */}
+              {/* Target language */}
               <div>
                 {trans ? (
                   <>
@@ -174,6 +214,20 @@ export default function SegmentEditor({ segments, onRefresh }: Props) {
 
               {/* Actions */}
               <div className="flex gap-1 justify-end">
+                {hasTTS && (
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    title="Play TTS audio"
+                    onClick={() => playTTS(seg.id)}
+                  >
+                    {playingId === seg.id ? (
+                      <Square className="w-3.5 h-3.5 text-primary" />
+                    ) : (
+                      <Play className="w-3.5 h-3.5" />
+                    )}
+                  </Button>
+                )}
                 {trans && (
                   <Button
                     size="icon"

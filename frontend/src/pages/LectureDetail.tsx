@@ -130,7 +130,17 @@ export default function LectureDetail() {
         <div className="mb-6 p-4 rounded-lg border border-border bg-card">
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-medium">
-              {activeJob.current_step ?? "Starting..."}
+              {(() => {
+                const steps: Record<string, string> = {
+                  extracting: "Extracting audio...",
+                  separating: "Separating vocals from background...",
+                  transcribing: "Transcribing speech...",
+                  translating: "Translating...",
+                  dubbing: "Generating dubbed audio...",
+                  done: "Complete",
+                };
+                return steps[activeJob.current_step ?? ""] ?? activeJob.current_step ?? "Starting...";
+              })()}
             </span>
             <span className="text-sm text-muted-foreground">
               {Math.round(activeJob.progress * 100)}%
@@ -167,7 +177,7 @@ export default function LectureDetail() {
               />
             </div>
             <div>
-              <h3 className="text-sm font-medium text-muted-foreground mb-2">Spanish Dub</h3>
+              <h3 className="text-sm font-medium text-muted-foreground mb-2">Dubbed ({lecture.target_language.toUpperCase()})</h3>
               {lecture.status === "exported" || lecture.status === "draft" ? (
                 <video
                   controls
@@ -185,7 +195,14 @@ export default function LectureDetail() {
       )}
 
       {/* Segment editor */}
-      {hasDraft && <SegmentEditor segments={segments} onRefresh={refresh} />}
+      {hasDraft && (
+        <SegmentEditor
+          segments={segments}
+          onRefresh={refresh}
+          sourceLanguage={lecture.source_language}
+          targetLanguage={lecture.target_language}
+        />
+      )}
 
       {/* Job history */}
       {jobs.length > 0 && (
