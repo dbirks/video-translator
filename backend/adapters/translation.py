@@ -1,52 +1,88 @@
-"""Translation adapters: Protocol + LLM implementation (stubbed for POC)."""
+"""Translation adapters: Protocol + OpenAI GPT-4o implementation."""
 
+import json
+import logging
 from typing import Protocol, runtime_checkable
+
+from openai import AsyncOpenAI
+
+log = logging.getLogger(__name__)
 
 
 @runtime_checkable
 class TranslationAdapter(Protocol):
-    async def translate(self, text: str, source_lang: str = "en", target_lang: str = "es") -> str:
+    async def translate(
+        self,
+        text: str,
+        source_lang: str = "en",
+        target_lang: str = "es",
+        context_before: str = "",
+        context_after: str = "",
+    ) -> str:
         """Translate text from source_lang to target_lang."""
         ...
 
 
-class LLMTranslationAdapter:
-    """
-    Translation adapter backed by an LLM (Mistral/OpenAI).
+class OpenAITranslationAdapter:
+    """Translation adapter using OpenAI GPT-4o."""
 
-    For the POC, this returns mock Spanish translations so the pipeline can
-    run end-to-end without a real API key. Replace the body of translate()
-    with real API calls when ready.
-    """
-
-    def __init__(self, api_key: str | None = None, model: str = "mistral-large-latest"):
-        self.api_key = api_key
+    def __init__(self, api_key: str, model: str = "gpt-4o"):
+        self.client = AsyncOpenAI(api_key=api_key)
         self.model = model
 
-    async def translate(self, text: str, source_lang: str = "en", target_lang: str = "es") -> str:
-        """Return a mock Spanish translation."""
-        # Simple mock mapping for common phrases
-        mock_translations: dict[str, str] = {
-            "Welcome to this lecture on machine learning fundamentals.":
-                "Bienvenidos a esta conferencia sobre los fundamentos del aprendizaje automático.",
-            "Today we will cover the basics of neural networks and deep learning.":
-                "Hoy cubriremos los conceptos básicos de las redes neuronales y el aprendizaje profundo.",
-            "A neural network consists of layers of interconnected nodes.":
-                "Una red neuronal consiste en capas de nodos interconectados.",
-            "Each node applies an activation function to its inputs.":
-                "Cada nodo aplica una función de activación a sus entradas.",
-            "Training involves adjusting weights to minimize a loss function.":
-                "El entrenamiento implica ajustar los pesos para minimizar una función de pérdida.",
-            "Backpropagation is the algorithm used to compute gradients.":
-                "La retropropagación es el algoritmo utilizado para calcular los gradientes.",
-            "Gradient descent updates the weights in the direction of steepest descent.":
-                "El descenso de gradiente actualiza los pesos en la dirección de mayor descenso.",
-        }
+    async def translate(
+        self,
+        text: str,
+        source_lang: str = "en",
+        target_lang: str = "es",
+        context_before: str = "",
+        context_after: str = "",
+    ) -> str:
+        lang_names = {"en": "English", "es": "Spanish", "fr": "French", "de": "German"}
+        source = lang_names.get(source_lang, source_lang)
+        target = lang_names.get(target_lang, target_lang)
 
-        if text in mock_translations:
-            return mock_translations[text]
+        system_prompt = (
+            f"You are a professional {target} translator specializing in educational and lecture content. "
+            f"Translate the given {source} text to {target}. "
+            "Preserve the original meaning accurately. Use natural, clear language appropriate for an academic audience. "
+            "Do not add, remove, or editorialize content. "
+            "Respond with ONLY the translated text, nothing else."
+        )
 
-        # Generic mock: prepend "[ES]" and append a Spanish filler
-        words = text.split()
-        mock = " ".join(words)  # keep same words as placeholder
-        return f"[Traducción de: {mock}]"
+        user_content = ""
+        if context_before:
+            user_content += f"[Previous segment: {context_before}]\n\n"
+        user_content += f"Translate this:\n{text}"
+        if context_after:
+            user_content += f"\n\n[Next segment: {context_after}]"
+
+        log.info(f"Translating ({len(text)} chars): {text[:80]}...")
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+
+        translated = response.choices[0].message.content.strip()
+        log.info(f"Translation result: {translated[:80]}...")
+        return translated
+
+
+class MockTranslationAdapter:
+    """Mock adapter for testing without API keys."""
+
+    async def translate(
+        self,
+        text: str,
+        source_lang: str = "en",
+        target_lang: str = "es",
+        context_before: str = "",
+        context_after: str = "",
+    ) -> str:
+        return f"[Traducción de: {text}]"

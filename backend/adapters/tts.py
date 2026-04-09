@@ -1,9 +1,14 @@
-"""TTS adapters: Protocol + Voxtral and ElevenLabs stubs."""
+"""TTS adapters: Protocol + OpenAI TTS implementation."""
 
+import logging
 import struct
 import wave
 from io import BytesIO
 from typing import Protocol, runtime_checkable
+
+from openai import AsyncOpenAI
+
+log = logging.getLogger(__name__)
 
 
 def _generate_silence_wav(duration_seconds: float = 1.0, sample_rate: int = 22050) -> bytes:
@@ -12,7 +17,7 @@ def _generate_silence_wav(duration_seconds: float = 1.0, sample_rate: int = 2205
     buf = BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(struct.pack("<" + "h" * n_samples, *([0] * n_samples)))
     return buf.getvalue()
@@ -25,18 +30,46 @@ class TTSAdapter(Protocol):
         text: str,
         voice_ref_path: str | None = None,
         language: str = "es",
-    ) -> bytes:
-        """Synthesize speech from text. Returns WAV audio bytes."""
+        speed: float = 1.0,
+    ) -> tuple[bytes, str]:
+        """Synthesize speech from text. Returns (audio_bytes, format)."""
         ...
 
 
-class VoxtralTTSAdapter:
-    """
-    TTS adapter for Voxtral (Mistral's TTS model).
+class OpenAITTSAdapter:
+    """TTS adapter using OpenAI tts-1 / tts-1-hd."""
 
-    For the POC, this returns a silent WAV placeholder so the pipeline can
-    run end-to-end. Replace synthesize() with real Voxtral API calls when ready.
-    """
+    # Available voices: alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer
+    def __init__(self, api_key: str, model: str = "tts-1", voice: str = "nova"):
+        self.client = AsyncOpenAI(api_key=api_key)
+        self.model = model
+        self.voice = voice
+
+    async def synthesize(
+        self,
+        text: str,
+        voice_ref_path: str | None = None,
+        language: str = "es",
+        speed: float = 1.0,
+    ) -> tuple[bytes, str]:
+        """Generate Spanish speech using OpenAI TTS. Returns (mp3_bytes, 'mp3')."""
+        log.info(f"TTS ({self.model}/{self.voice}, speed={speed}): {text[:60]}...")
+
+        response = await self.client.audio.speech.create(
+            model=self.model,
+            voice=self.voice,
+            input=text,
+            response_format="mp3",
+            speed=speed,
+        )
+
+        audio_bytes = response.content
+        log.info(f"TTS complete: {len(audio_bytes)} bytes")
+        return audio_bytes, "mp3"
+
+
+class VoxtralTTSAdapter:
+    """TTS adapter for Voxtral (Mistral). Placeholder — needs API spike."""
 
     def __init__(self, api_key: str | None = None, model_id: str = "voxtral-mini"):
         self.api_key = api_key
@@ -47,39 +80,42 @@ class VoxtralTTSAdapter:
         text: str,
         voice_ref_path: str | None = None,
         language: str = "es",
-    ) -> bytes:
-        """Return silent WAV as placeholder. ~0.5s of silence per 10 chars."""
+        speed: float = 1.0,
+    ) -> tuple[bytes, str]:
         word_count = len(text.split())
-        # Rough estimate: 150 words/min => 0.4s per word
         duration = max(0.5, word_count * 0.4)
-        return _generate_silence_wav(duration_seconds=duration)
+        return _generate_silence_wav(duration_seconds=duration), "wav"
 
 
 class ElevenLabsTTSAdapter:
-    """
-    TTS adapter for ElevenLabs.
+    """TTS adapter for ElevenLabs. Placeholder — needs API key."""
 
-    For the POC, returns silent WAV placeholder.
-    Replace synthesize() with real ElevenLabs API calls when ready.
-    """
-
-    def __init__(
-        self,
-        api_key: str | None = None,
-        voice_id: str = "21m00Tcm4TlvDq8ikWAM",  # Rachel voice
-        model_id: str = "eleven_multilingual_v2",
-    ):
+    def __init__(self, api_key: str | None = None, voice_id: str = "21m00Tcm4TlvDq8ikWAM"):
         self.api_key = api_key
         self.voice_id = voice_id
-        self.model_id = model_id
 
     async def synthesize(
         self,
         text: str,
         voice_ref_path: str | None = None,
         language: str = "es",
-    ) -> bytes:
-        """Return silent WAV as placeholder."""
+        speed: float = 1.0,
+    ) -> tuple[bytes, str]:
         word_count = len(text.split())
         duration = max(0.5, word_count * 0.4)
-        return _generate_silence_wav(duration_seconds=duration)
+        return _generate_silence_wav(duration_seconds=duration), "wav"
+
+
+class MockTTSAdapter:
+    """Mock adapter for testing without API keys."""
+
+    async def synthesize(
+        self,
+        text: str,
+        voice_ref_path: str | None = None,
+        language: str = "es",
+        speed: float = 1.0,
+    ) -> tuple[bytes, str]:
+        word_count = len(text.split())
+        duration = max(0.5, word_count * 0.4)
+        return _generate_silence_wav(duration_seconds=duration), "wav"

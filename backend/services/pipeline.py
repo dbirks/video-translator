@@ -159,20 +159,29 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
         # --- Step 5: Translate all segments ---
         step("translating", 0.55)
 
-        from backend.adapters.translation import LLMTranslationAdapter
+        from backend.adapters.translation import MockTranslationAdapter, OpenAITranslationAdapter
 
-        translator = LLMTranslationAdapter(api_key=s.mistral_api_key or None)
+        if s.openai_api_key:
+            translator = OpenAITranslationAdapter(api_key=s.openai_api_key)
+            provider_model = "gpt-4o"
+        else:
+            translator = MockTranslationAdapter()
+            provider_model = "mock"
 
-        for seg in db_segments:
+        for i, seg in enumerate(db_segments):
+            context_before = db_segments[i - 1].source_text_en if i > 0 else ""
+            context_after = db_segments[i + 1].source_text_en if i < len(db_segments) - 1 else ""
             translated_text = await translator.translate(
                 seg.source_text_en,
                 source_lang=lecture.source_language,
                 target_lang=lecture.target_language,
+                context_before=context_before,
+                context_after=context_after,
             )
             translation = Translation(
                 segment_id=seg.id,
                 translated_text=translated_text,
-                provider_model="mock",
+                provider_model=provider_model,
                 status="current",
             )
             session.add(translation)
@@ -181,9 +190,15 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
         # --- Step 6: TTS for all segments ---
         step("dubbing", 0.70)
 
-        from backend.adapters.tts import VoxtralTTSAdapter
+        from backend.adapters.tts import MockTTSAdapter, OpenAITTSAdapter
 
-        tts_adapter = VoxtralTTSAdapter(api_key=s.mistral_api_key or None)
+        if s.openai_api_key:
+            tts_adapter = OpenAITTSAdapter(api_key=s.openai_api_key)
+            tts_provider = "openai-tts-1"
+        else:
+            tts_adapter = MockTTSAdapter()
+            tts_provider = "mock"
+
         tts_dir = os.path.join(settings.media_dir, lecture_id, "tts")
         os.makedirs(tts_dir, exist_ok=True)
 
@@ -198,18 +213,21 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
             if not translation:
                 continue
 
-            audio_bytes = await tts_adapter.synthesize(translation.translated_text)
-            tts_rel = os.path.join(lecture_id, "tts", f"{seg.id}.wav")
+            audio_bytes, audio_fmt = await tts_adapter.synthesize(
+                translation.translated_text, language=lecture.target_language
+            )
+            tts_rel = os.path.join(lecture_id, "tts", f"{seg.id}.{audio_fmt}")
             tts_abs = os.path.join(settings.media_dir, tts_rel)
             with open(tts_abs, "wb") as f:
                 f.write(audio_bytes)
 
+            mime_type = "audio/mpeg" if audio_fmt == "mp3" else "audio/wav"
             tts_mo = MediaObject(
                 lecture_id=lecture_id,
                 kind="segment_tts",
                 file_path=tts_rel,
                 size_bytes=len(audio_bytes),
-                mime_type="audio/wav",
+                mime_type=mime_type,
             )
             session.add(tts_mo)
             session.flush()
@@ -217,7 +235,7 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
             tts_gen = TTSGeneration(
                 segment_id=seg.id,
                 media_object_id=tts_mo.id,
-                provider="voxtral",
+                provider=tts_provider,
                 input_text=translation.translated_text,
                 status="current",
             )

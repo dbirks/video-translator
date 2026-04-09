@@ -165,7 +165,7 @@ async def regenerate_tts(segment_id: str, session: SessionDep) -> TTSGeneration:
     if not tts:
         tts = TTSGeneration(
             segment_id=segment_id,
-            provider="voxtral",
+            provider="pending",
             input_text="",
             status="stale",
         )
@@ -179,8 +179,11 @@ async def regenerate_tts(segment_id: str, session: SessionDep) -> TTSGeneration:
 async def _regen_translation(segment_id: str) -> None:
     from sqlmodel import Session
 
-    from backend.adapters.translation import LLMTranslationAdapter
+    from backend.adapters.translation import MockTranslationAdapter, OpenAITranslationAdapter
+    from backend.config import get_settings
     from backend.database import engine
+
+    settings = get_settings()
 
     with Session(engine) as session:
         segment = session.get(Segment, segment_id)
@@ -195,13 +198,19 @@ async def _regen_translation(segment_id: str) -> None:
             t.status = "stale"
             session.add(t)
 
-        adapter = LLMTranslationAdapter()
+        if settings.openai_api_key:
+            adapter = OpenAITranslationAdapter(api_key=settings.openai_api_key)
+            provider_model = "gpt-4o"
+        else:
+            adapter = MockTranslationAdapter()
+            provider_model = "mock"
+
         translated = await adapter.translate(segment.source_text_en, source_lang="en", target_lang="es")
 
         new_translation = Translation(
             segment_id=segment_id,
             translated_text=translated,
-            provider_model="mock",
+            provider_model=provider_model,
             status="current",
         )
         session.add(new_translation)
@@ -209,10 +218,15 @@ async def _regen_translation(segment_id: str) -> None:
 
 
 async def _regen_tts(segment_id: str) -> None:
+    import os
+
     from sqlmodel import Session
 
-    from backend.adapters.tts import VoxtralTTSAdapter
+    from backend.adapters.tts import MockTTSAdapter, OpenAITTSAdapter
+    from backend.config import get_settings
     from backend.database import engine
+
+    settings = get_settings()
 
     with Session(engine) as session:
         segment = session.get(Segment, segment_id)
@@ -234,31 +248,32 @@ async def _regen_tts(segment_id: str) -> None:
             t.status = "stale"
             session.add(t)
 
-        adapter = VoxtralTTSAdapter()
-        audio_bytes = await adapter.synthesize(translation.translated_text)
+        if settings.openai_api_key:
+            adapter = OpenAITTSAdapter(api_key=settings.openai_api_key)
+            tts_provider = "openai-tts-1"
+        else:
+            adapter = MockTTSAdapter()
+            tts_provider = "mock"
 
-        # Save audio file
-        from backend.config import get_settings
-        import os
+        audio_bytes, audio_fmt = await adapter.synthesize(translation.translated_text)
 
-        settings = get_settings()
         tts_dir = os.path.join(settings.media_dir, segment.lecture_id, "tts")
         os.makedirs(tts_dir, exist_ok=True)
-        tts_filename = f"{segment_id}.wav"
-        tts_path = os.path.join(segment.lecture_id, "tts", tts_filename)
+        tts_path = os.path.join(segment.lecture_id, "tts", f"{segment_id}.{audio_fmt}")
         abs_path = os.path.join(settings.media_dir, tts_path)
 
-        async with __import__("aiofiles").open(abs_path, "wb") as f:
-            await f.write(audio_bytes)
+        with open(abs_path, "wb") as f:
+            f.write(audio_bytes)
 
         from backend.models import MediaObject
 
+        mime_type = "audio/mpeg" if audio_fmt == "mp3" else "audio/wav"
         mo = MediaObject(
             lecture_id=segment.lecture_id,
             kind="segment_tts",
             file_path=tts_path,
             size_bytes=len(audio_bytes),
-            mime_type="audio/wav",
+            mime_type=mime_type,
         )
         session.add(mo)
         session.flush()
@@ -266,7 +281,7 @@ async def _regen_tts(segment_id: str) -> None:
         tts_gen = TTSGeneration(
             segment_id=segment_id,
             media_object_id=mo.id,
-            provider="voxtral",
+            provider=tts_provider,
             input_text=translation.translated_text,
             status="current",
         )
