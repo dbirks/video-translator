@@ -12,6 +12,7 @@ dependencies = [
     "httpx",
     "pydantic-settings",
     "openai>=2.31.0",
+    "fish-audio-sdk>=1.3.0",
 ]
 
 [project.optional-dependencies]

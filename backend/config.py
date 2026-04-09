@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     mistral_api_key: str = ""
     elevenlabs_api_key: str = ""
+    fish_api_key: str = ""
 
 
 @lru_cache

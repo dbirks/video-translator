@@ -190,10 +190,34 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
         # --- Step 6: TTS for all segments (with fit-to-window) ---
         step("dubbing", 0.70)
 
-        from backend.adapters.tts import MockTTSAdapter, OpenAITTSAdapter
+        from backend.adapters.tts import FishAudioTTSAdapter, MockTTSAdapter, OpenAITTSAdapter
         from backend.services.media import get_duration
 
-        if s.openai_api_key:
+        # Extract a voice reference clip from the original audio (first clear segment, 5-15s)
+        voice_ref_path = None
+        if db_segments:
+            # Pick the longest segment (up to 15s) for best voice reference
+            best_seg = max(db_segments, key=lambda seg: min(seg.end_sec - seg.start_sec, 15.0))
+            ref_start = best_seg.start_sec
+            ref_end = min(best_seg.end_sec, ref_start + 15.0)
+            voice_ref_rel = os.path.join(lecture_id, "voice_reference.wav")
+            voice_ref_path = os.path.join(settings.media_dir, voice_ref_rel)
+            from backend.services.media import extract_clip
+            await extract_clip(wav_abs, voice_ref_path, ref_start, ref_end)
+
+            ref_mo = MediaObject(
+                lecture_id=lecture_id, kind="voice_reference",
+                file_path=voice_ref_rel, size_bytes=os.path.getsize(voice_ref_path),
+                mime_type="audio/wav",
+            )
+            session.add(ref_mo)
+            session.commit()
+
+        # Choose TTS adapter: Fish Audio (voice cloning) > OpenAI (no cloning) > Mock
+        if s.fish_api_key:
+            tts_adapter = FishAudioTTSAdapter(api_key=s.fish_api_key)
+            tts_provider = "fish-s2-pro"
+        elif s.openai_api_key:
             tts_adapter = OpenAITTSAdapter(api_key=s.openai_api_key)
             tts_provider = "openai-tts-1"
         else:
@@ -224,7 +248,10 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
             # Try generating at normal speed, then speed up if too long
             for attempt_speed in [1.0, 1.1, 1.2, 1.35]:
                 audio_bytes, audio_fmt = await tts_adapter.synthesize(
-                    translation.translated_text, language=lecture.target_language, speed=attempt_speed
+                    translation.translated_text,
+                    voice_ref_path=voice_ref_path,
+                    language=lecture.target_language,
+                    speed=attempt_speed,
                 )
                 # Write temp file to measure duration
                 tmp_path = os.path.join(tts_dir, f"{seg.id}_tmp.{audio_fmt}")

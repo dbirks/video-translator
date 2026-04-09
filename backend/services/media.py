@@ -207,6 +207,22 @@ async def mixdown_segments(
     log.info(f"Final mix loudness: {out_lufs:.1f} LUFS (target: {orig_lufs:.1f})")
 
 
+async def extract_clip(audio_path: str, output_path: str, start_sec: float, end_sec: float) -> None:
+    """Extract a clip from an audio file between start and end timestamps."""
+    duration = end_sec - start_sec
+    returncode, _, stderr = await _run_ffmpeg(
+        "-i", audio_path,
+        "-ss", str(start_sec),
+        "-t", str(duration),
+        "-acodec", "pcm_s16le",
+        "-ar", "44100",
+        "-ac", "1",
+        output_path,
+    )
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg extract_clip failed (rc={returncode}): {stderr}")
+
+
 async def mux_export(video_path: str, audio_path: str, output_path: str) -> None:
     """Replace the audio track of a video with the mixed audio, producing an MP4."""
     returncode, _, stderr = await _run_ffmpeg(

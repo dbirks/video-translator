@@ -222,7 +222,7 @@ async def _regen_tts(segment_id: str) -> None:
 
     from sqlmodel import Session
 
-    from backend.adapters.tts import MockTTSAdapter, OpenAITTSAdapter
+    from backend.adapters.tts import FishAudioTTSAdapter, MockTTSAdapter, OpenAITTSAdapter
     from backend.config import get_settings
     from backend.database import engine
 
@@ -248,14 +248,27 @@ async def _regen_tts(segment_id: str) -> None:
             t.status = "stale"
             session.add(t)
 
-        if settings.openai_api_key:
+        # Find voice reference if available
+        voice_ref_mo = session.exec(
+            select(MediaObject).where(
+                MediaObject.lecture_id == segment.lecture_id, MediaObject.kind == "voice_reference"
+            )
+        ).first()
+        voice_ref_path = os.path.join(settings.media_dir, voice_ref_mo.file_path) if voice_ref_mo else None
+
+        if settings.fish_api_key:
+            adapter = FishAudioTTSAdapter(api_key=settings.fish_api_key)
+            tts_provider = "fish-s2-pro"
+        elif settings.openai_api_key:
             adapter = OpenAITTSAdapter(api_key=settings.openai_api_key)
             tts_provider = "openai-tts-1"
         else:
             adapter = MockTTSAdapter()
             tts_provider = "mock"
 
-        audio_bytes, audio_fmt = await adapter.synthesize(translation.translated_text)
+        audio_bytes, audio_fmt = await adapter.synthesize(
+            translation.translated_text, voice_ref_path=voice_ref_path
+        )
 
         tts_dir = os.path.join(settings.media_dir, segment.lecture_id, "tts")
         os.makedirs(tts_dir, exist_ok=True)
