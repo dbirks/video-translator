@@ -187,10 +187,11 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
             session.add(translation)
         session.commit()
 
-        # --- Step 6: TTS for all segments ---
+        # --- Step 6: TTS for all segments (with fit-to-window) ---
         step("dubbing", 0.70)
 
         from backend.adapters.tts import MockTTSAdapter, OpenAITTSAdapter
+        from backend.services.media import get_duration
 
         if s.openai_api_key:
             tts_adapter = OpenAITTSAdapter(api_key=s.openai_api_key)
@@ -213,9 +214,36 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
             if not translation:
                 continue
 
-            audio_bytes, audio_fmt = await tts_adapter.synthesize(
-                translation.translated_text, language=lecture.target_language
-            )
+            window = seg.end_sec - seg.start_sec
+            speed = 1.0
+            audio_bytes = None
+            audio_fmt = "mp3"
+            tts_duration = 0.0
+            qa_flags = []
+
+            # Try generating at normal speed, then speed up if too long
+            for attempt_speed in [1.0, 1.1, 1.2, 1.35]:
+                audio_bytes, audio_fmt = await tts_adapter.synthesize(
+                    translation.translated_text, language=lecture.target_language, speed=attempt_speed
+                )
+                # Write temp file to measure duration
+                tmp_path = os.path.join(tts_dir, f"{seg.id}_tmp.{audio_fmt}")
+                with open(tmp_path, "wb") as f:
+                    f.write(audio_bytes)
+                try:
+                    tts_duration = await get_duration(tmp_path)
+                except Exception:
+                    tts_duration = 0.0
+                os.remove(tmp_path)
+
+                speed = attempt_speed
+                overflow = (tts_duration - window) / window if window > 0 else 0
+                if overflow <= 0.12:
+                    break  # fits within 12% tolerance
+
+            if tts_duration > window * 1.12:
+                qa_flags.append(f"TOO_LONG: {tts_duration:.1f}s vs {window:.1f}s window (speed={speed})")
+
             tts_rel = os.path.join(lecture_id, "tts", f"{seg.id}.{audio_fmt}")
             tts_abs = os.path.join(settings.media_dir, tts_rel)
             with open(tts_abs, "wb") as f:
@@ -232,11 +260,20 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
             session.add(tts_mo)
             session.flush()
 
+            # Update translation QA flags if overflow
+            if qa_flags:
+                import json
+                translation.qa_flags = json.dumps(qa_flags)
+                session.add(translation)
+
+            import json as _json
             tts_gen = TTSGeneration(
                 segment_id=seg.id,
                 media_object_id=tts_mo.id,
                 provider=tts_provider,
                 input_text=translation.translated_text,
+                duration_seconds=tts_duration,
+                settings_json=_json.dumps({"speed": speed, "window": window}),
                 status="current",
             )
             session.add(tts_gen)

@@ -47,15 +47,16 @@ class OpenAITranslationAdapter:
             f"Translate the given {source} text to {target}. "
             "Preserve the original meaning accurately. Use natural, clear language appropriate for an academic audience. "
             "Do not add, remove, or editorialize content. "
-            "Respond with ONLY the translated text, nothing else."
+            "The context lines (marked CONTEXT) are for reference only — do NOT translate or include them in your output. "
+            "Respond with ONLY the translated text of the main segment, nothing else."
         )
 
         user_content = ""
         if context_before:
-            user_content += f"[Previous segment: {context_before}]\n\n"
-        user_content += f"Translate this:\n{text}"
+            user_content += f"CONTEXT (previous): {context_before}\n\n"
+        user_content += f"TRANSLATE THIS:\n{text}"
         if context_after:
-            user_content += f"\n\n[Next segment: {context_after}]"
+            user_content += f"\n\nCONTEXT (next): {context_after}"
 
         log.info(f"Translating ({len(text)} chars): {text[:80]}...")
 

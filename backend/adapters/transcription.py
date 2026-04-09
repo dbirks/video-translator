@@ -9,7 +9,7 @@ log = logging.getLogger(__name__)
 
 
 class TranscriptSegment:
-    """Represents a single transcribed segment."""
+    """Represents a single transcribed segment with real timestamps."""
 
     def __init__(self, start: float, end: float, text: str, speaker: str | None = None):
         self.start = start
@@ -18,7 +18,7 @@ class TranscriptSegment:
         self.speaker = speaker
 
     def __repr__(self) -> str:
-        return f"TranscriptSegment(start={self.start}, end={self.end}, text={self.text!r})"
+        return f"TranscriptSegment(start={self.start:.2f}, end={self.end:.2f}, text={self.text!r})"
 
 
 @runtime_checkable
@@ -29,18 +29,13 @@ class TranscriptionAdapter(Protocol):
 
 
 class OpenAITranscriptionAdapter:
-    """Transcription adapter using OpenAI gpt-4o-transcribe-diarize."""
+    """Transcription using OpenAI gpt-4o-transcribe-diarize for real timestamps."""
 
-    def __init__(self, api_key: str, model: str = "gpt-4o-transcribe"):
+    def __init__(self, api_key: str, model: str = "gpt-4o-transcribe-diarize"):
         self.client = AsyncOpenAI(api_key=api_key)
         self.model = model
 
     async def transcribe(self, audio_path: str, language: str = "en") -> list[TranscriptSegment]:
-        """Transcribe audio and return timed segments.
-
-        Uses gpt-4o-transcribe with verbose_json for timestamps.
-        Falls back to gpt-4o-transcribe-diarize if available.
-        """
         import os
 
         file_size = os.path.getsize(audio_path)
@@ -53,48 +48,31 @@ class OpenAITranscriptionAdapter:
             response = await self.client.audio.transcriptions.create(
                 model=self.model,
                 file=f,
-                response_format="json",
+                response_format="diarized_json",
+                chunking_strategy="auto",
                 language=language,
             )
 
         segments = []
-        # gpt-4o-transcribe with json format returns logprobs/segments in some cases
-        # but primarily returns .text. Try to get segments if available.
-        resp_data = response.model_dump() if hasattr(response, "model_dump") else {}
-        raw_segments = resp_data.get("segments", [])
-
-        if raw_segments:
-            for seg in raw_segments:
+        if hasattr(response, "segments") and response.segments:
+            for seg in response.segments:
                 segments.append(
                     TranscriptSegment(
-                        start=seg.get("start", 0.0),
-                        end=seg.get("end", 0.0),
-                        text=seg.get("text", "").strip(),
-                        speaker=None,
+                        start=seg.start,
+                        end=seg.end,
+                        text=seg.text.strip(),
+                        speaker=seg.speaker,
                     )
                 )
-        else:
-            # No segments — split the full text into sentence-based segments
-            full_text = resp_data.get("text", "") or (response.text if hasattr(response, "text") else "")
-            if full_text:
-                from backend.services.media import get_duration
+            log.info(f"Diarized transcription: {len(segments)} segments, "
+                     f"speakers: {set(s.speaker for s in segments)}")
+        elif hasattr(response, "text") and response.text:
+            # Fallback if diarization returns no segments
+            from backend.services.media import get_duration
+            duration = await get_duration(audio_path)
+            segments.append(TranscriptSegment(start=0.0, end=duration, text=response.text.strip()))
+            log.warning("Diarization returned no segments, using full text as single segment")
 
-                duration = await get_duration(audio_path)
-                sentences = [s.strip() for s in full_text.replace(".", ".\n").split("\n") if s.strip()]
-                if not sentences:
-                    sentences = [full_text.strip()]
-                time_per_sentence = duration / len(sentences)
-                for i, sentence in enumerate(sentences):
-                    segments.append(
-                        TranscriptSegment(
-                            start=round(i * time_per_sentence, 2),
-                            end=round((i + 1) * time_per_sentence, 2),
-                            text=sentence,
-                            speaker=None,
-                        )
-                    )
-
-        log.info(f"Transcription complete: {len(segments)} segments")
         return segments
 
 
