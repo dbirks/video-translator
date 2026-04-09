@@ -144,6 +144,36 @@ export default function LectureDetail() {
         </div>
       )}
 
+      {/* Video player */}
+      {lecture.status !== "uploaded" && (
+        <div className="mb-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <h3 className="text-sm font-medium text-muted-foreground mb-2">Original</h3>
+              <video
+                controls
+                className="w-full rounded-lg border border-border bg-black"
+                src={`/api/lectures/${id}/media/source_video`}
+              />
+            </div>
+            <div>
+              <h3 className="text-sm font-medium text-muted-foreground mb-2">Spanish Dub</h3>
+              {lecture.status === "exported" || lecture.status === "draft" ? (
+                <video
+                  controls
+                  className="w-full rounded-lg border border-border bg-black"
+                  src={`/api/lectures/${id}/media/export_mp4`}
+                />
+              ) : (
+                <div className="w-full aspect-video rounded-lg border border-border bg-black flex items-center justify-center text-muted-foreground text-sm">
+                  Export not ready yet
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Segment editor */}
       {hasDraft && <SegmentEditor segments={segments} onRefresh={refresh} />}
 

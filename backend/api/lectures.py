@@ -5,6 +5,7 @@ from typing import Annotated
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -53,6 +54,35 @@ def get_lecture(lecture_id: str, session: SessionDep) -> Lecture:
     if not lecture:
         raise HTTPException(status_code=404, detail="Lecture not found")
     return lecture
+
+
+@router.get("/media/{media_object_id}")
+def serve_media(media_object_id: str, session: SessionDep):
+    mo = session.get(MediaObject, media_object_id)
+    if not mo:
+        raise HTTPException(status_code=404, detail="Media not found")
+    settings = get_settings()
+    abs_path = os.path.join(settings.media_dir, mo.file_path)
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    return FileResponse(abs_path, media_type=mo.mime_type or "application/octet-stream")
+
+
+@router.get("/lectures/{lecture_id}/media/{kind}")
+def serve_lecture_media(lecture_id: str, kind: str, session: SessionDep):
+    """Serve a media file by lecture ID and kind (e.g., export_mp4, source_video)."""
+    mo = session.exec(
+        select(MediaObject)
+        .where(MediaObject.lecture_id == lecture_id, MediaObject.kind == kind)
+        .order_by(MediaObject.created_at.desc())  # type: ignore[arg-type]
+    ).first()
+    if not mo:
+        raise HTTPException(status_code=404, detail=f"No {kind} media found")
+    settings = get_settings()
+    abs_path = os.path.join(settings.media_dir, mo.file_path)
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    return FileResponse(abs_path, media_type=mo.mime_type or "application/octet-stream")
 
 
 @router.post("/lectures/{lecture_id}/upload", response_model=MediaObject)
