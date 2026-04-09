@@ -10,7 +10,6 @@ import {
   exportLecture,
   getSegments,
   getJobs,
-  subscribeToEvents,
   type Lecture,
   type SegmentWithTranslation,
   type Job,
@@ -40,16 +39,27 @@ export default function LectureDetail() {
     refresh();
   }, [refresh]);
 
+  // Poll for job updates while a job is active — SSE is unreliable
   useEffect(() => {
     if (!id || !activeJob) return;
-    const es = subscribeToEvents(id, (data) => {
-      if (data.status === "completed" || data.status === "failed") {
-        refresh();
-      } else if (data.progress !== undefined) {
-        setActiveJob((prev) => (prev ? { ...prev, ...(data as Partial<Job>) } : prev));
+    const interval = setInterval(async () => {
+      try {
+        const [l, j] = await Promise.all([getLecture(id), getJobs(id)]);
+        setLecture(l);
+        setJobs(j);
+        const running = j.find((job) => job.status === "running" || job.status === "pending");
+        if (running) {
+          setActiveJob(running);
+        } else {
+          // Job finished — do a full refresh to pick up segments/media
+          setActiveJob(null);
+          await refresh();
+        }
+      } catch {
+        // ignore polling errors
       }
-    });
-    return () => es.close();
+    }, 3000);
+    return () => clearInterval(interval);
   }, [id, activeJob, refresh]);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
