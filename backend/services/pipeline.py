@@ -166,9 +166,34 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
         for seg in db_segments:
             session.refresh(seg)
 
-        # --- Step 5: Translate all segments ---
-        step("translating", 0.55)
+        # --- Step 5: Merge segments into utterance groups ---
+        # Combine consecutive segments with small gaps into natural sentence groups.
+        # This produces much more natural TTS (one call per sentence/paragraph
+        # instead of one per fragment).
+        step("translating", 0.50)
 
+        MAX_GAP = 2.0  # seconds — merge if gap is less than this
+        groups: list[list] = []  # each group is a list of consecutive Segment objects
+        current_group: list = []
+
+        for seg in db_segments:
+            if not current_group:
+                current_group = [seg]
+            else:
+                gap = seg.start_sec - current_group[-1].end_sec
+                same_speaker = (seg.speaker or "") == (current_group[-1].speaker or "")
+                if gap < MAX_GAP and same_speaker:
+                    current_group.append(seg)
+                else:
+                    groups.append(current_group)
+                    current_group = [seg]
+        if current_group:
+            groups.append(current_group)
+
+        _publish(lecture_id, {"step": "translating", "progress": 0.52,
+                              "detail": f"Merged {len(db_segments)} segments into {len(groups)} utterance groups"})
+
+        # --- Step 5b: Translate each group as a whole ---
         from backend.adapters.translation import MockTranslationAdapter, OpenAITranslationAdapter
 
         if s.openai_api_key:
@@ -178,35 +203,50 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
             translator = MockTranslationAdapter()
             provider_model = "mock"
 
-        for i, seg in enumerate(db_segments):
-            context_before = db_segments[i - 1].source_text_en if i > 0 else ""
-            context_after = db_segments[i + 1].source_text_en if i < len(db_segments) - 1 else ""
+        group_translations: list[str] = []
+        for gi, group in enumerate(groups):
+            group_text = " ".join(seg.source_text_en for seg in group)
+            context_before = " ".join(s.source_text_en for s in groups[gi - 1]) if gi > 0 else ""
+            context_after = " ".join(s.source_text_en for s in groups[gi + 1]) if gi < len(groups) - 1 else ""
+
             translated_text = await translator.translate(
-                seg.source_text_en,
+                group_text,
                 source_lang=lecture.source_language,
                 target_lang=lecture.target_language,
                 context_before=context_before,
                 context_after=context_after,
             )
-            translation = Translation(
-                segment_id=seg.id,
-                translated_text=translated_text,
-                provider_model=provider_model,
-                status="current",
-            )
-            session.add(translation)
+            group_translations.append(translated_text)
+
+            # Store translation on the first segment of the group (the others get a reference)
+            for si, seg in enumerate(group):
+                if si == 0:
+                    translation = Translation(
+                        segment_id=seg.id,
+                        translated_text=translated_text,
+                        provider_model=provider_model,
+                        status="current",
+                    )
+                else:
+                    # Mark non-primary segments as part of the group
+                    translation = Translation(
+                        segment_id=seg.id,
+                        translated_text=f"[part of group with {group[0].id[:8]}]",
+                        provider_model=provider_model,
+                        status="current",
+                    )
+                session.add(translation)
         session.commit()
 
-        # --- Step 6: TTS for all segments (with fit-to-window) ---
+        # --- Step 6: TTS per utterance group (with fit-to-window) ---
         step("dubbing", 0.70)
 
         from backend.adapters.tts import FishAudioTTSAdapter, MockTTSAdapter, OpenAITTSAdapter
         from backend.services.media import get_duration
 
-        # Extract a voice reference clip from the original audio (first clear segment, 5-15s)
+        # Extract a voice reference clip from the original audio
         voice_ref_path = None
         if db_segments:
-            # Pick the longest segment (up to 15s) for best voice reference
             best_seg = max(db_segments, key=lambda seg: min(seg.end_sec - seg.start_sec, 15.0))
             ref_start = best_seg.start_sec
             ref_end = min(best_seg.end_sec, ref_start + 15.0)
@@ -223,7 +263,6 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
             session.add(ref_mo)
             session.commit()
 
-        # Choose TTS adapter: Fish Audio (voice cloning) > OpenAI (no cloning) > Mock
         if s.fish_api_key:
             tts_adapter = FishAudioTTSAdapter(api_key=s.fish_api_key)
             tts_provider = "fish-s2-pro"
@@ -237,34 +276,29 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
         tts_dir = os.path.join(settings.media_dir, lecture_id, "tts")
         os.makedirs(tts_dir, exist_ok=True)
 
-        for seg in db_segments:
-            translation = session.exec(
-                select(Translation).where(
-                    Translation.segment_id == seg.id,
-                    Translation.status == "current",
-                )
-            ).first()
+        # TTS one audio file per group, placed at the group's start time
+        group_tts_paths: list[str] = []
+        group_timestamps: list[tuple[float, float]] = []
 
-            if not translation:
-                continue
+        for gi, (group, translated_text) in enumerate(zip(groups, group_translations)):
+            group_start = group[0].start_sec
+            group_end = group[-1].end_sec
+            window = group_end - group_start
 
-            window = seg.end_sec - seg.start_sec
             speed = 1.0
             audio_bytes = None
             audio_fmt = "mp3"
             tts_duration = 0.0
             qa_flags = []
 
-            # Try generating at normal speed, then speed up if too long
             for attempt_speed in [1.0, 1.1, 1.2, 1.35]:
                 audio_bytes, audio_fmt = await tts_adapter.synthesize(
-                    translation.translated_text,
+                    translated_text,
                     voice_ref_path=voice_ref_path,
                     language=lecture.target_language,
                     speed=attempt_speed,
                 )
-                # Write temp file to measure duration
-                tmp_path = os.path.join(tts_dir, f"{seg.id}_tmp.{audio_fmt}")
+                tmp_path = os.path.join(tts_dir, f"group_{gi}_tmp.{audio_fmt}")
                 with open(tmp_path, "wb") as f:
                     f.write(audio_bytes)
                 try:
@@ -275,42 +309,47 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
 
                 speed = attempt_speed
                 overflow = (tts_duration - window) / window if window > 0 else 0
-                if overflow <= 0.12:
-                    break  # fits within 12% tolerance
+                if overflow <= 0.15:
+                    break
 
-            if tts_duration > window * 1.12:
+            if tts_duration > window * 1.15:
                 qa_flags.append(f"TOO_LONG: {tts_duration:.1f}s vs {window:.1f}s window (speed={speed})")
 
-            tts_rel = os.path.join(lecture_id, "tts", f"{seg.id}.{audio_fmt}")
+            group_file = f"group_{gi}.{audio_fmt}"
+            tts_rel = os.path.join(lecture_id, "tts", group_file)
             tts_abs = os.path.join(settings.media_dir, tts_rel)
             with open(tts_abs, "wb") as f:
                 f.write(audio_bytes)
 
+            group_tts_paths.append(tts_abs)
+            group_timestamps.append((group_start, group_end))
+
             mime_type = "audio/mpeg" if audio_fmt == "mp3" else "audio/wav"
             tts_mo = MediaObject(
-                lecture_id=lecture_id,
-                kind="segment_tts",
-                file_path=tts_rel,
-                size_bytes=len(audio_bytes),
-                mime_type=mime_type,
+                lecture_id=lecture_id, kind="segment_tts",
+                file_path=tts_rel, size_bytes=len(audio_bytes), mime_type=mime_type,
             )
             session.add(tts_mo)
             session.flush()
 
-            # Update translation QA flags if overflow
-            if qa_flags:
-                import json
-                translation.qa_flags = json.dumps(qa_flags)
-                session.add(translation)
-
+            # Store TTS generation on the first segment of the group
             import json as _json
+            first_seg = group[0]
+            if qa_flags:
+                first_trans = session.exec(
+                    select(Translation).where(Translation.segment_id == first_seg.id, Translation.status == "current")
+                ).first()
+                if first_trans:
+                    first_trans.qa_flags = _json.dumps(qa_flags)
+                    session.add(first_trans)
+
             tts_gen = TTSGeneration(
-                segment_id=seg.id,
+                segment_id=first_seg.id,
                 media_object_id=tts_mo.id,
                 provider=tts_provider,
-                input_text=translation.translated_text,
+                input_text=translated_text,
                 duration_seconds=tts_duration,
-                settings_json=_json.dumps({"speed": speed, "window": window}),
+                settings_json=_json.dumps({"speed": speed, "window": window, "group_size": len(group)}),
                 status="current",
             )
             session.add(tts_gen)
@@ -319,23 +358,6 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
 
         # --- Step 7: Mixdown ---
         step("dubbing", 0.85)
-
-        segment_tts_paths = []
-        timestamps = []
-
-        for seg in db_segments:
-            tts_gen = session.exec(
-                select(TTSGeneration).where(
-                    TTSGeneration.segment_id == seg.id,
-                    TTSGeneration.status == "current",
-                )
-            ).first()
-
-            if tts_gen and tts_gen.media_object_id:
-                tts_mo = session.get(MediaObject, tts_gen.media_object_id)
-                if tts_mo:
-                    segment_tts_paths.append(os.path.join(settings.media_dir, tts_mo.file_path))
-                    timestamps.append((seg.start_sec, seg.end_sec))
 
         mix_rel = os.path.join(lecture_id, "spanish_mix.mp3")
         mix_abs = os.path.join(settings.media_dir, mix_rel)
@@ -352,7 +374,7 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
         orig_audio_path = os.path.join(settings.media_dir, orig_audio_mo.file_path) if orig_audio_mo else None
 
         await mixdown_segments(
-            segment_tts_paths, timestamps, duration or 60.0, mix_abs,
+            group_tts_paths, group_timestamps, duration or 60.0, mix_abs,
             original_audio_path=orig_audio_path,
         )
 
