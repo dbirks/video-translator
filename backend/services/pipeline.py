@@ -26,23 +26,33 @@ def _update_job(session: Session, job: Job, **kwargs) -> None:
     session.commit()
 
 
-async def run_pipeline(lecture_id: str, session: Session) -> None:
+async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = None) -> None:
     """
     Full pipeline: extract_audio -> normalize -> transcribe -> translate -> tts -> mixdown -> mux
-    Creates/updates a Job record and publishes SSE progress events.
+    Uses an existing Job record if job_id is provided, otherwise creates one.
     """
     settings = get_settings()
 
-    # Create a job record
-    job = Job(
-        lecture_id=lecture_id,
-        job_type="full_pipeline",
-        status="running",
-        started_at=datetime.utcnow().isoformat(),
-    )
-    session.add(job)
-    session.commit()
-    session.refresh(job)
+    if job_id:
+        job = session.get(Job, job_id)
+        if job:
+            job.status = "running"
+            job.started_at = datetime.utcnow().isoformat()
+            session.add(job)
+            session.commit()
+        else:
+            job = None
+
+    if not job_id or not job:
+        job = Job(
+            lecture_id=lecture_id,
+            job_type="full_pipeline",
+            status="running",
+            started_at=datetime.utcnow().isoformat(),
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
 
     lecture = session.get(Lecture, lecture_id)
     if not lecture:

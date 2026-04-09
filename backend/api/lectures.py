@@ -141,7 +141,7 @@ async def process_lecture(lecture_id: str, session: SessionDep) -> Job:
     session.commit()
     session.refresh(job)
 
-    asyncio.create_task(_start_pipeline(lecture_id))
+    asyncio.create_task(_start_pipeline(lecture_id, job.id))
     return job
 
 
@@ -164,14 +164,14 @@ async def export_lecture(lecture_id: str, session: SessionDep) -> Job:
     return job
 
 
-async def _start_pipeline(lecture_id: str) -> None:
+async def _start_pipeline(lecture_id: str, job_id: str | None = None) -> None:
     from sqlmodel import Session
 
     from backend.database import engine
     from backend.services.pipeline import run_pipeline
 
     with Session(engine) as session:
-        await run_pipeline(lecture_id, session)
+        await run_pipeline(lecture_id, session, job_id=job_id)
 
 
 async def _run_export(lecture_id: str, job_id: str) -> None:

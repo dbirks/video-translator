@@ -157,21 +157,19 @@ async def mixdown_segments(
         orig_idx = len(segment_audio_paths) + 1
         inputs += ["-i", original_audio_path]
 
-        # Build the original audio chain:
-        # - Base volume at 100% (for gaps — music, transitions)
-        # - Mute completely during speech windows (with small fade padding)
-        orig_filter = f"[{orig_idx}]aresample=44100,aformat=channel_layouts=stereo"
+        # Mute the original audio for the entire speech region (first segment
+        # start to last segment end). This prevents English bleeding through
+        # in gaps between diarized segments. Pre-speech (intro music) and
+        # post-speech (outro) play at full volume.
+        first_speech = max(0, timestamps[0][0] - 0.3)  # small pre-fade
+        last_speech = timestamps[-1][1] + 0.3  # small post-fade
+        log.info(f"Muting original audio from {first_speech:.1f}s to {last_speech:.1f}s")
 
-        for start_sec, end_sec in timestamps:
-            fade_in = 0.15  # seconds to fade back in after speech
-            fade_out = 0.08  # seconds to fade out before speech
-            mute_start = max(0, start_sec - fade_out)
-            mute_end = end_sec + fade_in
-            orig_filter += (
-                f",volume=0:enable='between(t,{mute_start:.3f},{mute_end:.3f})'"
-            )
-
-        orig_filter += "[orig_processed]"
+        orig_filter = (
+            f"[{orig_idx}]aresample=44100,aformat=channel_layouts=stereo,"
+            f"volume=0:enable='between(t,{first_speech:.3f},{last_speech:.3f})'"
+            f"[orig_processed]"
+        )
         filter_parts.append(orig_filter)
 
         # Mix: original (background) + TTS (speech)
