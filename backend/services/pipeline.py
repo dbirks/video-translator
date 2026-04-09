@@ -130,6 +130,25 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
         session.add(norm_media)
         session.commit()
 
+        # --- Step 3b: Separate vocals from background ---
+        step("separating", 0.28)
+        bg_rel = os.path.join(lecture_id, "background_audio.wav")
+        bg_abs = os.path.join(settings.media_dir, bg_rel)
+
+        from backend.services.media import separate_vocals
+
+        await separate_vocals(wav_abs, bg_abs)
+
+        bg_media = MediaObject(
+            lecture_id=lecture_id,
+            kind="background_audio",
+            file_path=bg_rel,
+            size_bytes=os.path.getsize(bg_abs),
+            mime_type="audio/wav",
+        )
+        session.add(bg_media)
+        session.commit()
+
         # --- Step 4: Transcribe ---
         step("transcribing", 0.35)
 
@@ -434,14 +453,21 @@ async def run_pipeline(lecture_id: str, session: Session, job_id: str | None = N
 
         from backend.services.media import mixdown_segments
 
-        # Find the original extracted audio to mix underneath (preserves background sounds)
-        orig_audio_mo = session.exec(
+        # Use the vocal-separated background track if available, otherwise fall back to full audio
+        bg_audio_mo = session.exec(
             select(MediaObject).where(
                 MediaObject.lecture_id == lecture_id,
-                MediaObject.kind == "extracted_audio",
+                MediaObject.kind == "background_audio",
             )
         ).first()
-        orig_audio_path = os.path.join(settings.media_dir, orig_audio_mo.file_path) if orig_audio_mo else None
+        if not bg_audio_mo:
+            bg_audio_mo = session.exec(
+                select(MediaObject).where(
+                    MediaObject.lecture_id == lecture_id,
+                    MediaObject.kind == "extracted_audio",
+                )
+            ).first()
+        orig_audio_path = os.path.join(settings.media_dir, bg_audio_mo.file_path) if bg_audio_mo else None
 
         await mixdown_segments(
             group_tts_paths, group_timestamps, duration or 60.0, mix_abs,

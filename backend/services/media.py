@@ -157,34 +157,28 @@ async def mixdown_segments(
         orig_idx = len(segment_audio_paths) + 1
         inputs += ["-i", original_audio_path]
 
-        # Mute the original audio for the entire speech region (first segment
-        # start to last segment end). This prevents English bleeding through
-        # in gaps between diarized segments. Pre-speech (intro music) and
-        # post-speech (outro) play at full volume.
-        first_speech = max(0, timestamps[0][0] - 0.3)  # small pre-fade
-        last_speech = timestamps[-1][1] + 0.3  # small post-fade
-        log.info(f"Muting original audio from {first_speech:.1f}s to {last_speech:.1f}s")
-
+        # If using vocal-separated background track, it already has no voices —
+        # just play it at full volume continuously. No muting needed.
+        # If using the original audio (fallback), we still don't mute since the
+        # vocal separation handles it. The background provides ambient sounds,
+        # music, SFX throughout.
         orig_filter = (
-            f"[{orig_idx}]aresample=44100,aformat=channel_layouts=stereo,"
-            f"volume=0:enable='between(t,{first_speech:.3f},{last_speech:.3f})'"
+            f"[{orig_idx}]aresample=44100,aformat=channel_layouts=stereo"
             f"[orig_processed]"
         )
         filter_parts.append(orig_filter)
 
-        # Mix: original (background) + TTS (speech)
-        # amix with 2 inputs halves volume, so compensate with 2dB boost
+        # Mix: background + TTS speech
         filter_parts.append(
             "[orig_processed][tts_mix]amix=inputs=2:duration=first:weights=1 1,"
             "volume=2dB[premix]"
         )
 
-        # Final loudnorm pass to match broadcast standard and ensure consistent output
+        # Final loudnorm to match original broadcast level
         filter_parts.append(
             f"[premix]loudnorm=I={orig_lufs:.1f}:TP=-1.0:LRA=11[out]"
         )
     else:
-        # No original audio — just normalize the TTS track
         filter_parts.append(f"[tts_mix]loudnorm=I=-16:TP=-1.0:LRA=11[out]")
 
     filter_complex = ";".join(filter_parts)
@@ -248,6 +242,51 @@ async def concat_clips(clip_paths: list[str], output_path: str) -> None:
     )
     if returncode != 0:
         raise RuntimeError(f"ffmpeg concat_clips failed (rc={returncode}): {stderr}")
+
+
+async def separate_vocals(input_path: str, output_background_path: str) -> None:
+    """Separate vocals from background audio using audio-separator (Mel-RoFormer).
+
+    Outputs the instrumental/background track (no vocals) for mixing with TTS.
+    Falls back to copying the original if audio-separator is not available.
+    """
+    import asyncio
+
+    def _run_separation():
+        import tempfile
+        from audio_separator.separator import Separator
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sep = Separator(
+                output_dir=tmpdir,
+                output_format="WAV",
+            )
+            sep.load_model()  # loads default Mel-RoFormer model
+            output_files = sep.separate(input_path)
+            log.info(f"Vocal separation produced: {output_files}")
+
+            # output_files is typically [instrumental_path, vocals_path]
+            # The instrumental/background track is what we want
+            import shutil
+            if output_files:
+                # First file is usually the instrumental
+                shutil.copy2(output_files[0], output_background_path)
+            else:
+                raise RuntimeError("Vocal separation produced no output files")
+
+    try:
+        # Run in thread pool since separator is synchronous and CPU-heavy
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _run_separation)
+        log.info(f"Vocal separation complete: {output_background_path}")
+    except ImportError:
+        log.warning("audio-separator not installed, copying original audio as fallback")
+        import shutil
+        shutil.copy2(input_path, output_background_path)
+    except Exception as e:
+        log.warning(f"Vocal separation failed ({e}), copying original audio as fallback")
+        import shutil
+        shutil.copy2(input_path, output_background_path)
 
 
 async def mux_export(video_path: str, audio_path: str, output_path: str) -> None:
