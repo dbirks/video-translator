@@ -305,7 +305,19 @@ async def run_pipeline(lecture_id: str, session: Session) -> None:
 
         from backend.services.media import mixdown_segments
 
-        await mixdown_segments(segment_tts_paths, timestamps, duration or 60.0, mix_abs)
+        # Find the original extracted audio to mix underneath (preserves background sounds)
+        orig_audio_mo = session.exec(
+            select(MediaObject).where(
+                MediaObject.lecture_id == lecture_id,
+                MediaObject.kind == "extracted_audio",
+            )
+        ).first()
+        orig_audio_path = os.path.join(settings.media_dir, orig_audio_mo.file_path) if orig_audio_mo else None
+
+        await mixdown_segments(
+            segment_tts_paths, timestamps, duration or 60.0, mix_abs,
+            original_audio_path=orig_audio_path,
+        )
 
         mix_mo = MediaObject(
             lecture_id=lecture_id,

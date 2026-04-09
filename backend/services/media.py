@@ -1,6 +1,7 @@
 """FFmpeg-based media operations using asyncio subprocesses."""
 
 import asyncio
+import json
 import os
 
 
@@ -21,7 +22,7 @@ async def extract_audio(video_path: str, output_path: str) -> None:
     """Extract audio from video as WAV (PCM 16-bit, original sample rate)."""
     returncode, _, stderr = await _run_ffmpeg(
         "-i", video_path,
-        "-vn",           # no video
+        "-vn",
         "-acodec", "pcm_s16le",
         "-ar", "44100",
         "-ac", "2",
@@ -32,13 +33,13 @@ async def extract_audio(video_path: str, output_path: str) -> None:
 
 
 async def normalize_audio(wav_path: str, output_path: str, target_bitrate: str = "64k") -> None:
-    """Normalize audio: convert to mono MP3 at target bitrate."""
+    """Normalize audio: convert to mono MP3 at target bitrate for transcription."""
     returncode, _, stderr = await _run_ffmpeg(
         "-i", wav_path,
-        "-ac", "1",               # mono
+        "-ac", "1",
         "-acodec", "libmp3lame",
         "-b:a", target_bitrate,
-        "-af", "loudnorm",        # EBU R128 loudness normalization
+        "-af", "loudnorm",
         output_path,
     )
     if returncode != 0:
@@ -50,44 +51,106 @@ async def mixdown_segments(
     timestamps: list[tuple[float, float]],
     total_duration: float,
     output_path: str,
+    original_audio_path: str | None = None,
 ) -> None:
     """
-    Compose a full audio track from segment TTS files placed at their timestamps.
-    Silence pads gaps between segments.
+    Compose a full audio track from segment TTS files placed at their timestamps,
+    mixed with the original audio (ducked during speech).
 
-    segment_audio_paths: list of absolute paths to WAV/MP3 files
-    timestamps: list of (start_sec, end_sec) tuples matching segment_audio_paths
-    total_duration: total video duration in seconds
-    output_path: path for the output MP3
+    If original_audio_path is provided, the original audio plays underneath at
+    reduced volume during speech segments and normal volume otherwise.
     """
     if not segment_audio_paths:
-        # Create a silent track if no segments
-        returncode, _, stderr = await _run_ffmpeg(
-            "-f", "lavfi",
-            "-i", f"anullsrc=r=44100:cl=mono:d={total_duration}",
-            "-acodec", "libmp3lame",
-            "-b:a", "64k",
-            output_path,
-        )
+        if original_audio_path:
+            # Just copy the original audio
+            returncode, _, stderr = await _run_ffmpeg(
+                "-i", original_audio_path,
+                "-acodec", "libmp3lame",
+                "-b:a", "128k",
+                output_path,
+            )
+        else:
+            returncode, _, stderr = await _run_ffmpeg(
+                "-f", "lavfi",
+                "-i", f"anullsrc=r=44100:cl=mono:d={total_duration}",
+                "-acodec", "libmp3lame",
+                "-b:a", "128k",
+                output_path,
+            )
         if returncode != 0:
-            raise RuntimeError(f"ffmpeg silent track failed (rc={returncode}): {stderr}")
+            raise RuntimeError(f"ffmpeg mixdown failed: {stderr}")
         return
 
-    # Build a complex filter graph that:
-    # 1. Creates a silent base track of total_duration
-    # 2. Overlays each segment at its start time using amix/adelay
+    # Strategy:
+    # 1. Build a TTS-only track: place each TTS segment at its timestamp, boost volume
+    # 2. If we have original audio, duck it during speech and mix with TTS track
+    # 3. If no original audio, just output the TTS track
+
+    inputs = []
     filter_parts = []
-    inputs = ["-f", "lavfi", "-i", f"anullsrc=r=44100:cl=mono:d={total_duration}"]
 
-    for i, (audio_path, (start_sec, _)) in enumerate(zip(segment_audio_paths, timestamps)):
+    # Input 0: silence base (for TTS overlay timing)
+    inputs += ["-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:d={total_duration}"]
+
+    # Inputs 1..N: TTS segment audio files
+    for audio_path in segment_audio_paths:
         inputs += ["-i", audio_path]
-        delay_ms = int(start_sec * 1000)
-        filter_parts.append(f"[{i + 1}]adelay={delay_ms}|{delay_ms}[delayed{i}]")
 
-    # Mix everything together
-    delayed_labels = "".join(f"[delayed{i}]" for i in range(len(segment_audio_paths)))
-    n_inputs = len(segment_audio_paths) + 1
-    filter_parts.append(f"[0]{delayed_labels}amix=inputs={n_inputs}:duration=first[out]")
+    # Delay each TTS segment to its start time and boost volume
+    for i, (start_sec, _end_sec) in enumerate(timestamps):
+        delay_ms = int(start_sec * 1000)
+        # Boost TTS volume by 6dB and convert to stereo if needed
+        filter_parts.append(
+            f"[{i + 1}]aresample=44100,aformat=channel_layouts=stereo,"
+            f"volume=6dB,adelay={delay_ms}|{delay_ms}[tts{i}]"
+        )
+
+    # Mix all TTS segments onto the silence base
+    # Use weights to prevent amix from averaging down the volume
+    tts_labels = "".join(f"[tts{i}]" for i in range(len(segment_audio_paths)))
+    n_tts = len(segment_audio_paths) + 1  # +1 for silence base
+    weights = " ".join(["0"] + ["1"] * len(segment_audio_paths))
+    filter_parts.append(
+        f"[0]{tts_labels}amix=inputs={n_tts}:duration=first:weights={weights},"
+        f"volume={n_tts}dB[tts_mix]"
+    )
+
+    if original_audio_path:
+        # Add original audio as another input
+        orig_idx = len(segment_audio_paths) + 1
+        inputs += ["-i", original_audio_path]
+
+        # Build a volume automation for the original audio:
+        # Lower volume during speech segments, keep it during gaps
+        # Use sidechaincompress or volume with enable expressions
+        duck_volume = 0.15  # 15% volume during speech
+        normal_volume = 0.7  # 70% volume during non-speech (background level)
+
+        # Build enable expressions for ducking
+        # We use the volume filter with 'enable' to duck during each segment
+        duck_filters = f"[{orig_idx}]aresample=44100,aformat=channel_layouts=stereo"
+        # Apply a base volume reduction
+        duck_filters += f",volume={normal_volume}"
+
+        # For each speech segment, reduce volume further
+        for start_sec, end_sec in timestamps:
+            # Pad the duck window slightly for smoother transitions
+            duck_start = max(0, start_sec - 0.1)
+            duck_end = end_sec + 0.1
+            ratio = duck_volume / normal_volume
+            duck_filters += (
+                f",volume='{ratio}':enable='between(t,{duck_start:.2f},{duck_end:.2f})'"
+            )
+
+        duck_filters += "[orig_ducked]"
+        filter_parts.append(duck_filters)
+
+        # Final mix: ducked original + TTS
+        filter_parts.append(
+            "[orig_ducked][tts_mix]amix=inputs=2:duration=first:weights=1 1[out]"
+        )
+    else:
+        filter_parts.append("[tts_mix]acopy[out]")
 
     filter_complex = ";".join(filter_parts)
 
@@ -96,7 +159,7 @@ async def mixdown_segments(
         "-filter_complex", filter_complex,
         "-map", "[out]",
         "-acodec", "libmp3lame",
-        "-b:a", "64k",
+        "-b:a", "128k",
         output_path,
     )
     if returncode != 0:
@@ -104,15 +167,15 @@ async def mixdown_segments(
 
 
 async def mux_export(video_path: str, audio_path: str, output_path: str) -> None:
-    """Replace the audio track of a video with new audio, producing an MP4."""
+    """Replace the audio track of a video with the mixed audio, producing an MP4."""
     returncode, _, stderr = await _run_ffmpeg(
         "-i", video_path,
         "-i", audio_path,
-        "-c:v", "copy",       # copy video stream unchanged
-        "-map", "0:v:0",      # video from first input
-        "-map", "1:a:0",      # audio from second input
+        "-c:v", "copy",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "192k",
         "-shortest",
         output_path,
     )
@@ -132,7 +195,5 @@ async def get_duration(media_path: str) -> float:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await proc.communicate()
-    import json
-
     info = json.loads(stdout.decode())
     return float(info.get("format", {}).get("duration", 0.0))
