@@ -53,28 +53,46 @@ class OpenAITranscriptionAdapter:
             response = await self.client.audio.transcriptions.create(
                 model=self.model,
                 file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
+                response_format="json",
                 language=language,
             )
 
         segments = []
-        if hasattr(response, "segments") and response.segments:
-            for seg in response.segments:
+        # gpt-4o-transcribe with json format returns logprobs/segments in some cases
+        # but primarily returns .text. Try to get segments if available.
+        resp_data = response.model_dump() if hasattr(response, "model_dump") else {}
+        raw_segments = resp_data.get("segments", [])
+
+        if raw_segments:
+            for seg in raw_segments:
                 segments.append(
                     TranscriptSegment(
-                        start=seg.get("start", 0.0) if isinstance(seg, dict) else getattr(seg, "start", 0.0),
-                        end=seg.get("end", 0.0) if isinstance(seg, dict) else getattr(seg, "end", 0.0),
-                        text=(seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")).strip(),
+                        start=seg.get("start", 0.0),
+                        end=seg.get("end", 0.0),
+                        text=seg.get("text", "").strip(),
                         speaker=None,
                     )
                 )
-        elif hasattr(response, "text") and response.text:
-            # Fallback: no segments returned, treat whole text as one segment
-            from backend.services.media import get_duration
+        else:
+            # No segments — split the full text into sentence-based segments
+            full_text = resp_data.get("text", "") or (response.text if hasattr(response, "text") else "")
+            if full_text:
+                from backend.services.media import get_duration
 
-            duration = await get_duration(audio_path)
-            segments.append(TranscriptSegment(start=0.0, end=duration, text=response.text.strip(), speaker=None))
+                duration = await get_duration(audio_path)
+                sentences = [s.strip() for s in full_text.replace(".", ".\n").split("\n") if s.strip()]
+                if not sentences:
+                    sentences = [full_text.strip()]
+                time_per_sentence = duration / len(sentences)
+                for i, sentence in enumerate(sentences):
+                    segments.append(
+                        TranscriptSegment(
+                            start=round(i * time_per_sentence, 2),
+                            end=round((i + 1) * time_per_sentence, 2),
+                            text=sentence,
+                            speaker=None,
+                        )
+                    )
 
         log.info(f"Transcription complete: {len(segments)} segments")
         return segments
