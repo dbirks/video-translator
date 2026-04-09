@@ -23,3 +23,9 @@ data/
 
 # Docker
 .dockerignore
+
+# Test/sample videos
+*.mp4
+*.mkv
+*.webm
+*.avi
