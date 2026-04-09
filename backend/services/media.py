@@ -123,7 +123,7 @@ async def mixdown_segments(
         # Build a volume automation for the original audio:
         # Lower volume during speech segments, keep it during gaps
         # Use sidechaincompress or volume with enable expressions
-        duck_volume = 0.15  # 15% volume during speech
+        duck_volume = 0.0  # completely mute original during speech
         normal_volume = 0.7  # 70% volume during non-speech (background level)
 
         # Build enable expressions for ducking
